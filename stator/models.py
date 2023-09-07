@@ -7,10 +7,13 @@ from django.db import models, transaction
 from django.db.models.signals import class_prepared
 from django.utils import timezone
 from django.utils.functional import classproperty
+from opentelemetry import trace
 
 from core import exceptions
 from stator.exceptions import TryAgainLater
 from stator.graph import State, StateGraph
+
+tracer = trace.get_tracer(__name__)
 
 
 class StateField(models.CharField):
@@ -137,6 +140,7 @@ class StatorModel(models.Model):
         return selected
 
     @classmethod
+    @tracer.start_as_current_span("transition_delete_due")
     def transition_delete_due(cls) -> int | None:
         """
         Finds instances of this model that need to be deleted and deletes them

@@ -6,6 +6,7 @@ import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 
+from opentelemetry import trace
 from django.conf import settings
 from django.db import close_old_connections
 from django.utils import timezone
@@ -13,6 +14,8 @@ from django.utils import timezone
 from core import exceptions, sentry
 from core.models import Config
 from stator.models import StatorModel, Stats
+
+tracer = trace.get_tracer(__name__)
 
 
 class LoopingTimer:
@@ -88,30 +91,31 @@ class StatorRunner:
         try:
             with sentry.configure_scope() as scope:
                 while True:
-                    # See if we need to run cleaning
-                    if self.scheduling_timer.check():
-                        # Set up the watchdog timer (each time we do this the previous one is cancelled)
-                        signal.alarm(self.schedule_interval * 2)
-                        # Write liveness file if configured
-                        if self.liveness_file:
-                            with open(self.liveness_file, "w") as fh:
-                                fh.write(str(int(time.time())))
-                        # Refresh the config
-                        self.load_config()
-                        # Do scheduling (stale lock deletion and stats gathering)
-                        self.run_scheduling()
+                    with tracer.start_as_current_span("main_task_loop"):
+                        # See if we need to run cleaning
+                        if self.scheduling_timer.check():
+                            # Set up the watchdog timer (each time we do this the previous one is cancelled)
+                            signal.alarm(self.schedule_interval * 2)
+                            # Write liveness file if configured
+                            if self.liveness_file:
+                                with open(self.liveness_file, "w") as fh:
+                                    fh.write(str(int(time.time())))
+                            # Refresh the config
+                            self.load_config()
+                            # Do scheduling (stale lock deletion and stats gathering)
+                            self.run_scheduling()
 
-                    # Clear the cleaning breadcrumbs/extra for the main part of the loop
-                    sentry.scope_clear(scope)
+                        # Clear the cleaning breadcrumbs/extra for the main part of the loop
+                        sentry.scope_clear(scope)
 
-                    self.clean_tasks()
+                        self.clean_tasks()
 
-                    # See if we need to add deletion tasks
-                    if self.deletion_timer.check():
-                        self.add_deletion_tasks()
+                        # See if we need to add deletion tasks
+                        if self.deletion_timer.check():
+                            self.add_deletion_tasks()
 
-                    # Fetch and run any new handlers we can fit
-                    self.add_transition_tasks()
+                        # Fetch and run any new handlers we can fit
+                        self.add_transition_tasks()
 
                     # Are we in limited run mode?
                     if (
@@ -157,6 +161,7 @@ class StatorRunner:
         """
         Config.system = Config.load_system()
 
+    @tracer.start_as_current_span("run_scheduling")
     def run_scheduling(self):
         """
         Deletes stale locks for models, and submits their stats.
@@ -169,6 +174,7 @@ class StatorRunner:
                 self.submit_stats(model)
                 model.transition_clean_locks()
 
+    @tracer.start_as_current_span("submit_stats")
     def submit_stats(self, model: type[StatorModel]):
         """
         Pop some statistics into the database from our local info for the given model
@@ -181,6 +187,7 @@ class StatorRunner:
         stats_instance.trim_data()
         stats_instance.save()
 
+    @tracer.start_as_current_span("add_transition_tasks")
     def add_transition_tasks(self, call_inline=False):
         """
         Adds a transition thread for as many instances as we can, given capacity
@@ -212,6 +219,7 @@ class StatorRunner:
                     )
                     space_remaining -= 1
 
+    @tracer.start_as_current_span("add_deletion_tasks")
     def add_deletion_tasks(self, call_inline=False):
         """
         Adds a deletion thread for each model
@@ -226,6 +234,7 @@ class StatorRunner:
                         model._meta.label_lower, "__delete__"
                     ] = self.executor.submit(task_deletion, model)
 
+    @tracer.start_as_current_span("clean_tasks")
     def clean_tasks(self):
         """
         Removes any tasks that are done and handles exceptions if they
@@ -255,16 +264,18 @@ def task_transition(instance: StatorModel, in_thread: bool = True):
     """
     task_name = f"stator.task_transition:{instance._meta.label_lower}#{{id}} from {instance.state}"
     started = time.monotonic()
-    with sentry.start_transaction(op="task", name=task_name):
-        sentry.set_context(
-            "instance",
-            {
+    with (
+        sentry.start_transaction(op="task", name=task_name),
+        tracer.start_as_current_span(task_name) as span
+    ):
+        attributes = {
                 "model": instance._meta.label_lower,
                 "pk": instance.pk,
                 "state": instance.state,
                 "state_age": instance.state_age,
-            },
-        )
+        }
+        span.set_attributes(attributes)
+        sentry.set_context("instance", attributes)
         result = instance.transition_attempt()
         duration = time.monotonic() - started
         if result:
@@ -279,6 +290,7 @@ def task_transition(instance: StatorModel, in_thread: bool = True):
         close_old_connections()
 
 
+@tracer.start_as_current_span("task_deletion")
 def task_deletion(model: type[StatorModel], in_thread: bool = True):
     """
     Runs one model deletion set.
